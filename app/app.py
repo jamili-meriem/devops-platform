@@ -3,6 +3,7 @@ import random
 import string
 
 import psycopg
+import redis
 from flask import Flask, jsonify, redirect, request
 
 app = Flask(__name__)
@@ -11,6 +12,10 @@ DATABASE_URL = os.environ.get(
     "DATABASE_URL",
     "postgresql://shortly:shortly_pass@localhost:5432/shortly",
 )
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+CACHE_TTL = int(os.environ.get("CACHE_TTL", "3600"))
+
+cache = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 
 def get_conn():
@@ -65,6 +70,16 @@ def shorten():
 
 @app.route("/<code>")
 def go(code):
+    try:
+        url = cache.get(f"url:{code}")
+        if url:
+            cache.incr(f"clicks:{code}")
+            resp = redirect(url, code=302)
+            resp.headers["X-Cache"] = "HIT"
+            return resp
+    except redis.RedisError:
+        pass
+
     with get_conn() as conn:
         row = conn.execute(
             "UPDATE links SET clicks = clicks + 1 WHERE code = %s RETURNING url",
@@ -72,7 +87,14 @@ def go(code):
         ).fetchone()
     if row is None:
         return jsonify(error="Lien introuvable"), 404
-    return redirect(row[0], code=302)
+
+    try:
+        cache.set(f"url:{code}", row[0], ex=CACHE_TTL)
+    except redis.RedisError:
+        pass
+    resp = redirect(row[0], code=302)
+    resp.headers["X-Cache"] = "MISS"
+    return resp
 
 
 @app.route("/stats/<code>")
@@ -83,7 +105,12 @@ def stats(code):
         ).fetchone()
     if row is None:
         return jsonify(error="Lien introuvable"), 404
-    return jsonify(code=code, url=row[0], clicks=row[1])
+    pending = 0
+    try:
+        pending = int(cache.get(f"clicks:{code}") or 0)
+    except redis.RedisError:
+        pass
+    return jsonify(code=code, url=row[0], clicks=row[1] + pending)
 
 
 if __name__ == "__main__":
